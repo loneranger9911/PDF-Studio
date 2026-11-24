@@ -1,0 +1,41 @@
+name: Build and release installer
+
+# Push a tag like v1.0.0 and this builds the installer and attaches it to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build the app (folder build, which starts faster and trips antivirus less than one-file)
+        run: pyinstaller --noconsole --noconfirm --name PDFStudio pdf_studio.py
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" installer.iss
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: installer_output/PDFStudio-Setup.exe
+          generate_release_notes: true

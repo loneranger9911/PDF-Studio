@@ -3,16 +3,16 @@
 ; CI passes the version in:  ISCC.exe /DAppVersion=1.2.3 installer.iss
 
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "1.2.0"
 #endif
 
 [Setup]
 ; Generate your own GUID once (PowerShell: [guid]::NewGuid()) and keep it forever.
 ; It is how Windows recognizes upgrades of the same app. Keep the doubled {{ at the start.
-AppId={{REPLACE-WITH-YOUR-OWN-GUID}
+AppId={{3f1c6eff-cbf9-485a-aba6-8c8f3a88bbb4}
 AppName=PDF Studio
 AppVersion={#AppVersion}
-AppPublisher=YOUR NAME
+AppPublisher=Forge Crunch Studio
 DefaultDirName={autopf}\PDF Studio
 DefaultGroupName=PDF Studio
 UninstallDisplayIcon={app}\PDFStudio.exe

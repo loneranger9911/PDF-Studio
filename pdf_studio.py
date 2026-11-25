@@ -511,7 +511,7 @@ class ReplaceDialog(QDialog):
 # --------------------------------------------------------------------------
 # Continuous-scroll page canvas (pages on a grey desk, like Docs)
 # --------------------------------------------------------------------------
-POINT_TOOLS = {"comment", "form", "edit_text", "signature", "eraser"}
+POINT_TOOLS = {"comment", "form", "edit_text", "eraser"}
 RECT_TOOLS = {"md", "highlight", "underline", "strike", "image", "redact", "rect", "ellipse"}
 LINE_TOOLS = {"line", "arrow"}
 
@@ -519,6 +519,9 @@ LINE_TOOLS = {"line", "arrow"}
 class Canvas(QWidget):
     region = Signal(int, object)  # page index, Rect | Point | (Point, Point) | [Point...]
     zoom_step = Signal(int)
+    sig_placed = Signal(int, object)  # page index, fitz.Rect in PDF coordinates
+    sig_request = Signal()            # user clicked with the Sign tool but has no signature yet
+    sig_started = Signal()            # a signature is now floating, ready to move/resize
     MARGIN, GAP = 28, 18
 
     def __init__(self):
@@ -539,9 +542,18 @@ class Canvas(QWidget):
         self.drag = None
         self.stroke = []
         self.live_line = None
+        self.sig_pm = None          # the user's signature as a pixmap
+        self.sig_aspect = 0.4       # height / width
+        self.sig_width = 110.0      # default width in PDF points
+        self.pending = None         # {'page': int, 'rect': fitz.Rect in displayed-page points}
+        self._sig_drag = None
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_doc(self, doc):
         self.doc = doc
+        self.pending = None
+        self._sig_drag = None
         self.layout_pages()
 
     def layout_pages(self):
@@ -615,6 +627,7 @@ class Canvas(QWidget):
                     for rect in self.fields(i):
                         self._draw_rect(p, r, fitz.Rect(rect) * rot)
             i += 1
+        self._paint_signature(p)
         # live overlays for the pen and line tools
         pen = QPen(self.pen_color, max(1.0, self.pen_width * self.zoom), Qt.PenStyle.SolidLine,
                    Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
@@ -644,6 +657,9 @@ class Canvas(QWidget):
     def mousePressEvent(self, e):
         if self.tool == "hand" or not self.doc or e.button() != Qt.MouseButton.LeftButton:
             return
+        if self.tool == "signature":
+            self._sig_press(e)
+            return
         pos = e.position().toPoint()
         loc = self._locate(pos)
         if not loc:
@@ -660,6 +676,11 @@ class Canvas(QWidget):
             self.band.show()
 
     def mouseMoveEvent(self, e):
+        if self._sig_drag:
+            self._sig_move(e)
+            return
+        if self.tool == "signature" and self.pending:
+            self._sig_cursor(e.position().toPoint())
         if not self.drag:
             return
         pos = e.position().toPoint()
@@ -673,6 +694,9 @@ class Canvas(QWidget):
             self.band.setGeometry(QRect(self.drag[1], pos).normalized())
 
     def mouseReleaseEvent(self, e):
+        if self._sig_drag:
+            self._sig_drag = None
+            return
         if not self.drag:
             return
         i, start = self.drag
@@ -692,6 +716,170 @@ class Canvas(QWidget):
                 self.region.emit(i, (p1, p2))
             elif abs(a.x() - b.x()) > 8 and abs(a.y() - b.y()) > 8:
                 self.region.emit(i, fitz.Rect(p1, p2).normalize())
+
+    # ----- signature placement: float it, move it, resize it, then stamp it -----
+    def set_signature(self, png_bytes):
+        img = QImage.fromData(png_bytes)
+        if img.isNull():
+            self.sig_pm = None
+            return
+        self.sig_pm = QPixmap.fromImage(img)
+        self.sig_aspect = img.height() / max(img.width(), 1)
+        if self.pending:
+            self._sig_resize_to_width(self.sig_width)
+        self.update()
+
+    def set_sig_width(self, w):
+        self.sig_width = float(w)
+        if self.pending:
+            self._sig_resize_to_width(self.sig_width)
+            self.update()
+
+    def cancel_signature(self):
+        if self.pending or self._sig_drag:
+            self.pending, self._sig_drag = None, None
+            self.update()
+
+    def commit_signature(self):
+        if not self.pending:
+            return
+        i, r = self.pending["page"], self.pending["rect"]
+        pdf_rect = (fitz.Rect(r) * self.doc[i].derotation_matrix).normalize()
+        self.pending, self._sig_drag = None, None
+        self.update()
+        self.sig_placed.emit(i, pdf_rect)
+
+    def _clamp_rect(self, i, r):
+        """Keep the signature on the page and keep its proportions."""
+        pr = self.doc[i].rect
+        w = min(r.width, pr.width)
+        h = w * self.sig_aspect
+        if h > pr.height:
+            h = pr.height
+            w = h / self.sig_aspect if self.sig_aspect else w
+        x0 = min(max(r.x0, 0.0), pr.width - w)
+        y0 = min(max(r.y0, 0.0), pr.height - h)
+        return fitz.Rect(x0, y0, x0 + w, y0 + h)
+
+    def _sig_resize_to_width(self, w):
+        i, r = self.pending["page"], self.pending["rect"]
+        cx, cy = (r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2
+        h = w * self.sig_aspect
+        self.pending["rect"] = self._clamp_rect(i, fitz.Rect(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2))
+
+    def _page_origin(self, i):
+        w, _h = self.sizes[i]
+        return QPoint((self.width() - w) // 2, self.tops[i])
+
+    def _sig_px_rect(self):
+        i, r = self.pending["page"], self.pending["rect"]
+        o, z = self._page_origin(i), self.zoom
+        return QRect(o.x() + int(r.x0 * z), o.y() + int(r.y0 * z), max(1, int(r.width * z)),
+                     max(1, int(r.height * z)))
+
+    def _sig_hit(self, pos):
+        """-> ('corner', anchor_x, anchor_y) | ('move',) | None   (anchor = the opposite corner, in points)"""
+        if not self.pending:
+            return None
+        rect = self._sig_px_rect()
+        r = self.pending["rect"]
+        corners = (("tl", rect.topLeft(), (r.x1, r.y1)), ("tr", rect.topRight(), (r.x0, r.y1)),
+                   ("bl", rect.bottomLeft(), (r.x1, r.y0)), ("br", rect.bottomRight(), (r.x0, r.y0)))
+        for _name, pt, anchor in corners:
+            if (pos - pt).manhattanLength() <= 14:
+                return ("corner", anchor[0], anchor[1])
+        if rect.adjusted(-4, -4, 4, 4).contains(pos):
+            return ("move",)
+        return None
+
+    def _sig_cursor(self, pos):
+        hit = self._sig_hit(pos)
+        if hit and hit[0] == "corner":
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif hit:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def _sig_press(self, e):
+        self.setFocus()
+        if self.sig_pm is None:
+            self.sig_request.emit()
+            return
+        pos = e.position().toPoint()
+        hit = self._sig_hit(pos)
+        if hit and hit[0] == "corner":
+            self._sig_drag = ("corner", (hit[1], hit[2]))
+            return
+        if hit:  # inside: drag to move
+            i = self.pending["page"]
+            local = self._locate(pos, i)[1]
+            r = self.pending["rect"]
+            self._sig_drag = ("move", (local.x() / self.zoom - r.x0, local.y() / self.zoom - r.y0))
+            return
+        loc = self._locate(pos)  # elsewhere: (re)start here
+        if not loc:
+            return
+        i, local = loc
+        w = self.sig_width
+        h = w * self.sig_aspect
+        cx, cy = local.x() / self.zoom, local.y() / self.zoom
+        self.pending = {"page": i, "rect": self._clamp_rect(i, fitz.Rect(cx - w / 2, cy - h / 2,
+                                                                          cx + w / 2, cy + h / 2))}
+        r = self.pending["rect"]
+        self._sig_drag = ("move", (cx - r.x0, cy - r.y0))
+        self.update()
+        self.sig_started.emit()
+
+    def _sig_move(self, e):
+        if not self.pending:
+            return
+        d = self._sig_drag
+        i, r = self.pending["page"], self.pending["rect"]
+        local = self._locate(e.position().toPoint(), i)[1]
+        mx, my = local.x() / self.zoom, local.y() / self.zoom
+        if d[0] == "move":
+            ox, oy = d[1]
+            nr = fitz.Rect(mx - ox, my - oy, mx - ox + r.width, my - oy + r.height)
+        else:
+            ax, ay = d[1]
+            w = max(12.0, abs(mx - ax))
+            h = w * self.sig_aspect
+            x0 = ax if mx >= ax else ax - w
+            y0 = ay if my >= ay else ay - h
+            nr = fitz.Rect(x0, y0, x0 + w, y0 + h)
+        self.pending["rect"] = self._clamp_rect(i, nr)
+        self.update()
+
+    def _paint_signature(self, p):
+        if not self.pending or self.sig_pm is None:
+            return
+        rect = self._sig_px_rect()
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        p.drawPixmap(rect, self.sig_pm)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor("#1a73e8"), 1, Qt.PenStyle.DashLine))
+        p.drawRect(rect)
+        p.setPen(QPen(QColor("#1a73e8"), 1))
+        p.setBrush(QColor("white"))
+        for pt in (rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight()):
+            p.drawRect(QRect(pt.x() - 4, pt.y() - 4, 8, 8))
+
+    def mouseDoubleClickEvent(self, e):
+        if self.tool == "signature" and self.pending and self._sig_px_rect().contains(e.position().toPoint()):
+            self.commit_signature()
+        else:
+            super().mouseDoubleClickEvent(e)
+
+    def keyPressEvent(self, e):
+        if self.tool == "signature" and self.pending:
+            if e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self.commit_signature()
+                return
+            if e.key() == Qt.Key.Key_Escape:
+                self.cancel_signature()
+                return
+        super().keyPressEvent(e)
 
     def wheelEvent(self, e):
         if e.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -724,7 +912,7 @@ TOOLS = [
     ("image", "\U0001F5BC Image", "Drag a box, then choose an image"),
     ("comment", "\U0001F4AC Comment", "Click on the page to add a sticky-note comment"),
     ("form", "\U0001F4CB Fill form", "Click a (highlighted) form field to fill it in"),
-    ("signature", "\u270D Sign", "Click where your signature should go"),
+    ("signature", "\u270D Sign", "Click where your signature should go, then drag to move it or drag a corner to resize it"),
     ("pen", "\U0001F58A Pen", "Draw freehand"),
     ("line", "\u2571 Line", "Drag to draw a line"),
     ("arrow", "\u279C Arrow", "Drag to draw an arrow"),
@@ -762,12 +950,19 @@ class MainWindow(QMainWindow):
         sig = data_dir() / "signature.png"
         if sig.exists():
             self.sig_png = sig.read_bytes()
+        self.sig_width = int(self.settings.value("sig_width", 110, type=int))
         self.doc_actions, self.pdf_actions, self.tb_btns = [], [], {}
         self.setAcceptDrops(True)
 
         # --- opened-PDF canvas ---
         self.canvas = Canvas()
         self.canvas.region.connect(self.on_region)
+        self.canvas.sig_placed.connect(self.place_signature)
+        self.canvas.sig_request.connect(self.on_sig_request)
+        self.canvas.sig_started.connect(self.on_sig_started)
+        self.canvas.sig_width = float(self.sig_width)
+        if self.sig_png:
+            self.canvas.set_signature(self.sig_png)
         self.canvas.zoom_step.connect(lambda s: self.set_zoom(self.zoom * (1.1 if s > 0 else 1 / 1.1)))
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -1189,6 +1384,16 @@ class MainWindow(QMainWindow):
         self.width_spin.setToolTip("Stroke width")
         self.width_spin.valueChanged.connect(self.set_pen_width)
         self.tb_tools.addWidget(self.width_spin)
+        self.sig_spin = QSpinBox()
+        self.sig_spin.setRange(30, 400)
+        self.sig_spin.setSingleStep(10)
+        self.sig_spin.setValue(self.sig_width)
+        self.sig_spin.setPrefix("Signature ")
+        self.sig_spin.setSuffix(" pt")
+        self.sig_spin.setToolTip("Default signature width (72 pt = 1 inch). "
+                                 "You can also drag a corner to resize it before placing.")
+        self.sig_spin.valueChanged.connect(self.set_sig_width)
+        self.tb_tools.addWidget(self.sig_spin)
 
     def build_statusbar(self):
         self.words_label = QLabel("")
@@ -1988,21 +2193,19 @@ class MainWindow(QMainWindow):
             if png:
                 self.sig_png = png
                 (data_dir() / "signature.png").write_bytes(png)
+                self.canvas.set_signature(png)
                 return True
         return False
 
-    def place_signature(self, pno, pt):
-        if not self.sig_png and not self.draw_signature():
+    def place_signature(self, pno, rect):
+        """Stamp the signature into rect (PDF coordinates) on page pno."""
+        if not self.sig_png or self.doc is None:
             return
-        pix = fitz.Pixmap(self.sig_png)
-        w = 150.0
-        h = w * pix.height / pix.width
-        rect = fitz.Rect(pt.x - w / 2, pt.y - h / 2, pt.x + w / 2, pt.y + h / 2)
         self.snapshot()
         self.doc[pno].insert_image(rect, stream=self.sig_png, keep_proportion=True)
         self.refresh(changed=[pno])
+        self.statusBar().showMessage("Signature placed. Ctrl+Z undoes it. Click again to place another.", 6000)
 
-    # ===================== forms =====================
     def fill_form_at(self, pno, pt):
         page = self.doc[pno]
         field = next((w for w in (page.widgets() or []) if w.rect.contains(pt)), None)
@@ -2090,6 +2293,8 @@ class MainWindow(QMainWindow):
     def set_tool(self, name):
         self.tool = name
         self.canvas.tool = name
+        if name != "signature":
+            self.canvas.cancel_signature()
         self.canvas.setCursor(Qt.CursorShape.ArrowCursor if name == "hand" else Qt.CursorShape.CrossCursor)
         self.tool_actions[name].setChecked(True)
         self.canvas.update()
@@ -2113,9 +2318,6 @@ class MainWindow(QMainWindow):
             return
         if tool == "edit_text":
             self.edit_text_at(pno, obj)
-            return
-        if tool == "signature":
-            self.place_signature(pno, obj)
             return
         if tool == "eraser":
             target = next((a for a in page.annots() if a.rect.contains(obj)), None)
@@ -2547,6 +2749,19 @@ class MainWindow(QMainWindow):
             ed.find(q)
         ed.ensureCursorVisible()
         self.statusBar().showMessage(f"{len(self.matches)} match(es)", 4000)
+
+    def set_sig_width(self, v):
+        self.sig_width = int(v)
+        self.settings.setValue("sig_width", self.sig_width)
+        self.canvas.set_sig_width(v)
+
+    def on_sig_request(self):
+        if self.draw_signature():
+            self.statusBar().showMessage("Signature saved. Now click the page where it should go.", 6000)
+
+    def on_sig_started(self):
+        self.statusBar().showMessage("Drag the signature to move it, drag a corner to resize it, then press "
+                                     "Enter (or double-click it) to place it. Esc cancels.", 12000)
 
     def startup(self):
         self.offer_recovery()
